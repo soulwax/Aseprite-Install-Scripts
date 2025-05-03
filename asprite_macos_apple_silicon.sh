@@ -1,70 +1,92 @@
-#!/bin/bash
-# Aseprite Apple Silicon Bundler (M1/M2/M3)
-set -eo pipefail
+#!/usr/bin/env bash
+# -------------------------------------------------------
+#  Aseprite macOS-arm64 Build & Installer
+# -------------------------------------------------------
+set -euo pipefail
+IFS=$'\n\t'
 
-# --- Configuration ---
-BUILD_DIR="$HOME/aseprite-build"
+# ---------- Paths ----------
 DEPS_DIR="$HOME/deps"
-APP_NAME="Aseprite.app"
+WORKSPACE="$HOME/workspace/c++"
+REPO_DIR="$WORKSPACE/aseprite"
+BUILD_DIR="$REPO_DIR/build"
+
 SKIA_VERSION="m124-08a5439a6b"
+SKIA_ZIP="Skia-macOS-Release-arm64.zip"
+SKIA_URL="https://github.com/aseprite/skia/releases/download/${SKIA_VERSION}/${SKIA_ZIP}"
 
-# --- Homebrew Check ---
-install_brew() {
-    echo "Homebrew is required but not installed."
-    read -p "Would you like to install Homebrew now? (y/N) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "Installing Homebrew..."
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+DEPOT_DIR="$DEPS_DIR/depot_tools"
 
-        # Add Homebrew to PATH for current session
-        if [[ -x /opt/homebrew/bin/brew ]]; then
-            eval "$(/opt/homebrew/bin/brew shellenv)"
-        elif [[ -x /usr/local/bin/brew ]]; then
-            eval "$(/usr/local/bin/brew shellenv)"
-        fi
-    else
-        echo "Aborting: Homebrew is required to continue."
-        exit 1
-    fi
+APP="Aseprite.app"
+DEST="/Applications/${APP}"
+JOBS=$(sysctl -n hw.ncpu)
+
+CLEAN=false
+[[ ${1:-} == "--clean" ]] && CLEAN=true
+
+# ---------- Utilities ----------
+log() { printf "\033[32m==> %s\033[0m\n" "$1"; }
+cmd() {
+    printf "   \033[34m• %s\033[0m\n" "$*"
+    "$@"
 }
 
-# Check for Homebrew installation
+# ---------- Folders ----------
+log "Creating folders"
+$CLEAN && cmd rm -rf "$REPO_DIR" "$DEPS_DIR/skia" "$DEPS_DIR/depot_tools"
+mkdir -p "$DEPS_DIR" "$WORKSPACE"
+
+# ---------- Homebrew & packages ----------
 if ! command -v brew &>/dev/null; then
-    install_brew
+    printf "Homebrew missing – install from https://brew.sh and re-run.\n"
+    exit 1
+fi
+eval "$(brew shellenv)"
+for p in cmake ninja git imagemagick; do
+    brew list "$p" &>/dev/null || cmd brew install --quiet "$p"
+done
+
+# ---------- depot_tools ----------
+if [[ ! -d "$DEPOT_DIR/.git" ]]; then
+    log "Cloning depot_tools"
+    cmd git clone https://chromium.googlesource.com/chromium/tools/depot_tools "$DEPOT_DIR"
+fi
+# persist in shell startup file
+PROFILE="$HOME/.zsh_env"
+[[ -f $PROFILE ]] || PROFILE="$HOME/.zshrc"
+if ! grep -q "$DEPOT_DIR" "$PROFILE" 2>/dev/null; then
+    log "Adding depot_tools to PATH in $(basename "$PROFILE")"
+    echo "export PATH=\"$DEPOT_DIR:\$PATH\"" >>"$PROFILE"
+fi
+export PATH="$DEPOT_DIR:$PATH"
+
+# ---------- Skia ----------
+if [[ ! -d "$DEPS_DIR/skia" ]]; then
+    log "Downloading Skia arm64 ${SKIA_VERSION}"
+    pushd "$DEPS_DIR" >/dev/null
+    cmd curl -L -O "$SKIA_URL"
+    cmd unzip -q "$SKIA_ZIP" -d skia
+    cmd rm "$SKIA_ZIP"
+    popd >/dev/null
 fi
 
-# --- Clean Previous Builds ---
-rm -rf "$BUILD_DIR" "$DEPS_DIR"
-mkdir -p "$BUILD_DIR" "$DEPS_DIR"
-
-# --- Install Dependencies ---
-brew update
-brew install --quiet cmake ninja git imagemagick
-brew install --cask --quiet xquartz
-
-# --- Fetch Skia ---
-echo "Downloading Skia..."
-curl -LO "https://github.com/aseprite/skia/releases/download/$SKIA_VERSION/Skia-macOS-Release-arm64.zip"
-unzip -q "Skia-macOS-Release-arm64.zip" -d "$DEPS_DIR/skia"
-
-# --- Clone Aseprite ---
-git clone --recursive --depth 1 https://github.com/aseprite/aseprite.git "$BUILD_DIR"
-cd "$BUILD_DIR"
-
-# --- Icon Preprocessing ---
-ICON_SRC="data/icons/ase256.png"
-if [ -f "$ICON_SRC" ]; then
-    echo "Upscaling source icon..."
-    magick "$ICON_SRC" -filter Lanczos -resize 400% -unsharp 1.5x1+0.7+0.02 "/tmp/ase1024.png"
-    mv -f "/tmp/ase1024.png" "$ICON_SRC"
+# ---------- Aseprite source ----------
+if [[ ! -d "$REPO_DIR/.git" ]]; then
+    log "Cloning Aseprite"
+    cmd git clone --recursive https://github.com/aseprite/aseprite.git "$REPO_DIR"
+else
+    log "Updating Aseprite"
+    pushd "$REPO_DIR" >/dev/null
+    cmd git pull --ff-only
+    cmd git submodule update --init --recursive
+    popd >/dev/null
 fi
 
-# --- Build Configuration ---
-mkdir -p build
-cd build
-
-cmake \
+# ---------- Build ----------
+log "Configuring CMake"
+mkdir -p "$BUILD_DIR"
+pushd "$BUILD_DIR" >/dev/null
+cmd cmake \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
@@ -72,37 +94,64 @@ cmake \
     -DSKIA_DIR="$DEPS_DIR/skia" \
     -DSKIA_LIBRARY_DIR="$DEPS_DIR/skia/out/Release-arm64" \
     -DSKIA_LIBRARY="$DEPS_DIR/skia/out/Release-arm64/libskia.a" \
-    -G Ninja \
-    ..
+    -GNinja ..
+log "Building ($JOBS threads)"
+cmd ninja -j"$JOBS" aseprite
+popd >/dev/null
 
-# --- Compile ---
-echo "Building Aseprite..."
-ninja aseprite
+# ---------- Bundle ----------
+log "Creating ${APP}"
+pushd "$BUILD_DIR" >/dev/null
+rm -rf "$APP"
+mkdir -p "$APP/Contents/"{MacOS,Resources}
+cmd cp bin/aseprite "$APP/Contents/MacOS/"
+cmd cp -R bin/data "$APP/Contents/Resources/"
 
-# --- Create App Bundle ---
-echo "Creating application bundle..."
-mkdir -p "$APP_NAME/Contents/"{MacOS,Resources}
-cp bin/aseprite "$APP_NAME/Contents/MacOS/"
-cp -r bin/data "$APP_NAME/Contents/Resources/"
+# icon
+ICON="$APP/Contents/Resources/data/icons/ase256.png"
+if [[ -f "$ICON" && ! -f "$APP/Contents/Resources/Aseprite.icns" ]]; then
+    TMP=/tmp/ase1024.png
+    cmd magick "$ICON" -filter Lanczos -resize 1024x1024 "$TMP"
+    ICONSET=$(mktemp -d)
+    for s in 16 32 64 128 256 512; do
+        sips -z $s $s "$TMP" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+        [[ $s -eq 512 ]] && cp "$TMP" "$ICONSET/icon_${s}x${s}@2x.png" ||
+            sips -z $((s * 2)) $((s * 2)) "$TMP" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+    done
+    cmd iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/Aseprite.icns"
+    cmd rm -rf "$ICONSET" "$TMP"
+fi
 
-# --- Generate Icon Set ---
-ICON_SRC="$APP_NAME/Contents/Resources/data/icons/ase256.png"
-ICONSET_DIR="aseprite.iconset"
+# Info.plist
+cat >"$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key>       <string>aseprite</string>
+  <key>CFBundleIdentifier</key>       <string>org.aseprite.app</string>
+  <key>CFBundleName</key>             <string>Aseprite</string>
+  <key>CFBundleIconFile</key>         <string>Aseprite</string>
+  <key>NSHighResolutionCapable</key>  <true/>
+  <key>LSMinimumSystemVersion</key>   <string>11.0</string>
+  <key>LSMinimumSystemVersion</key>   <true/>
+  <string>11.0</string>
+    <key>CFBundlePackageType</key>      <string>APPL</string>
+</dict></plist>
+PLIST
+popd >/dev/null
 
-mkdir -p "$ICONSET_DIR"
-sips -z 16 16 "$ICON_SRC" --out "${ICONSET_DIR}/icon_16x16.png" >/dev/null
-sips -z 32 32 "$ICON_SRC" --out "${ICONSET_DIR}/icon_16x16@2x.png" >/dev/null
-sips -z 32 32 "$ICON_SRC" --out "${ICONSET_DIR}/icon_32x32.png" >/dev/null
-sips -z 64 64 "$ICON_SRC" --out "${ICONSET_DIR}/icon_32x32@2x.png" >/dev/null
-sips -z 128 128 "$ICON_SRC" --out "${ICONSET_DIR}/icon_128x128.png" >/dev/null
-sips -z 256 256 "$ICON_SRC" --out "${ICONSET_DIR}/icon_128x128@2x.png" >/dev/null
-sips -z 256 256 "$ICON_SRC" --out "${ICONSET_DIR}/icon_256x256.png" >/dev/null
-sips -z 512 512 "$ICON_SRC" --out "${ICONSET_DIR}/icon_256x256@2x.png" >/dev/null
-sips -z 512 512 "$ICON_SRC" --out "${ICONSET_DIR}/icon_512x512.png" >/dev/null
-sips -z 1024 1024 "$ICON_SRC" --out "${ICONSET_DIR}/icon_512x512@2x.png" >/dev/null
+# ---------- Install ----------
+log "Installing to /Applications"
+if [[ -w "/Applications" ]]; then
+    cmd rsync -a --delete "$BUILD_DIR/$APP" "$DEST"
+else
+    cmd sudo rsync -a --delete "$BUILD_DIR/$APP" "$DEST"
+fi
+cmd codesign --force --options=runtime --deep -s - "$DEST" # ad-hoc sign
+cmd xattr -dr com.apple.quarantine "$DEST"
 
-iconutil -c icns "$ICONSET_DIR" -o "$APP_NAME/Contents/Resources/Aseprite.icns"
-rm -rf "$ICONSET_DIR"
+log "✅  Build complete – launch Aseprite from /Applications."
 
 # --- Create Info.plist ---
 cat <<EOF >"$APP_NAME/Contents/Info.plist"
@@ -120,7 +169,6 @@ cat <<EOF >"$APP_NAME/Contents/Info.plist"
     <string>Aseprite.icns</string>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
 </dict>
 </plist>
